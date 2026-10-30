@@ -1,1 +1,368 @@
+(() => {
+  "use strict";
 
+  // ---------- Setup ----------
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const menu = document.getElementById("menu");
+  const gameoverPanel = document.getElementById("gameover");
+  const startBtn = document.getElementById("startBtn");
+  const restartBtn = document.getElementById("restartBtn");
+  const muteBtn = document.getElementById("muteBtn");
+  const bestMenu = document.getElementById("bestMenu");
+  const finalScore = document.getElementById("finalScore");
+  const newBest = document.getElementById("newBest");
+
+  const IMAGE_PATHS = {
+    player: "assets/player.svg",
+    lantern: "assets/lantern.svg",
+    hazard: "assets/hazard.svg",
+  };
+  const images = {};
+
+  const COLORS = { lantern: "#ffc857", hazard: "#7a52a0", player: "#e8e1d0", text: "#f3efe4" };
+
+  // ---------- Storage (safe) ----------
+  function loadBest() {
+    try { return parseInt(localStorage.getItem("mothrun-best"), 10) || 0; } catch { return 0; }
+  }
+  function saveBest(v) {
+    try { localStorage.setItem("mothrun-best", String(v)); } catch { /* ignore */ }
+  }
+  let best = loadBest();
+  bestMenu.textContent = best;
+
+  // ---------- Audio (synthesized, no files needed) ----------
+  let audioCtx = null;
+  let muted = false;
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    }
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+  }
+
+  function tone(freq, duration, type = "sine", volume = 0.15, slideTo = null) {
+    if (muted || !audioCtx) return;
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t + duration);
+    gain.gain.setValueAtTime(volume, t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + duration);
+  }
+
+  const sfx = {
+    collect() { tone(660, 0.12, "triangle", 0.18, 990); },
+    hit() { tone(220, 0.3, "sawtooth", 0.18, 70); },
+    over() { tone(330, 0.6, "triangle", 0.2, 80); },
+    start() { tone(440, 0.15, "triangle", 0.15, 880); },
+  };
+
+  muteBtn.addEventListener("click", () => {
+    muted = !muted;
+    muteBtn.textContent = muted ? "Sound off" : "Sound on";
+    muteBtn.setAttribute("aria-pressed", String(muted));
+  });
+
+  // ---------- Input ----------
+  const keys = new Set();
+  let pointerTarget = null;
+
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(k)) e.preventDefault();
+    if (k === "m") muteBtn.click();
+    keys.add(k);
+    pointerTarget = null;
+  });
+  window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+  function setPointer(e) {
+    const rect = canvas.getBoundingClientRect();
+    pointerTarget = {
+      x: ((e.clientX - rect.left) / rect.width) * W,
+      y: ((e.clientY - rect.top) / rect.height) * H,
+    };
+  }
+  canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); setPointer(e); });
+  canvas.addEventListener("pointermove", (e) => { if (e.buttons || e.pointerType === "touch") setPointer(e); });
+
+  // ---------- Game state ----------
+  const state = {
+    mode: "menu", // menu | playing | over
+    score: 0,
+    lives: 3,
+    time: 0,
+    spawnLantern: 0,
+    spawnHazard: 0,
+    invuln: 0,
+    shake: 0,
+  };
+  const player = { x: W / 2, y: H - 110, r: 18, vx: 0, vy: 0 };
+  let lanterns = [];
+  let hazards = [];
+  let particles = [];
+
+  const stars = Array.from({ length: 70 }, () => ({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    s: Math.random() * 1.6 + 0.4,
+    v: Math.random() * 20 + 8,
+  }));
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  function resetGame() {
+    state.score = 0;
+    state.lives = 3;
+    state.time = 0;
+    state.spawnLantern = 0.4;
+    state.spawnHazard = 1.2;
+    state.invuln = 0;
+    state.shake = 0;
+    player.x = W / 2;
+    player.y = H - 110;
+    lanterns = [];
+    hazards = [];
+    particles = [];
+    pointerTarget = null;
+  }
+
+  function startGame() {
+    ensureAudio();
+    resetGame();
+    state.mode = "playing";
+    menu.classList.add("hidden");
+    gameoverPanel.classList.add("hidden");
+    sfx.start();
+  }
+
+  function endGame() {
+    state.mode = "over";
+    sfx.over();
+    const isBest = state.score > best;
+    if (isBest) {
+      best = state.score;
+      saveBest(best);
+      bestMenu.textContent = best;
+    }
+    finalScore.textContent = state.score;
+    newBest.classList.toggle("hidden", !isBest);
+    gameoverPanel.classList.remove("hidden");
+  }
+
+  startBtn.addEventListener("click", startGame);
+  restartBtn.addEventListener("click", startGame);
+
+  // ---------- Particles ----------
+  function burst(x, y, color, n = 14) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = rand(40, 160);
+      particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.3, 0.7), max: 0.7, color });
+    }
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    // background stars always drift
+    for (const s of stars) {
+      s.y += s.v * dt;
+      if (s.y > H) { s.y = -2; s.x = Math.random() * W; }
+    }
+    for (const p of particles) {
+      p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    }
+    particles = particles.filter((p) => p.life > 0);
+
+    if (state.mode !== "playing") return;
+
+    state.time += dt;
+    state.invuln = Math.max(0, state.invuln - dt);
+    state.shake = Math.max(0, state.shake - dt);
+    const level = 1 + state.time / 25;
+
+    // Player movement
+    const speed = 300;
+    let dx = 0, dy = 0;
+    if (keys.has("arrowleft") || keys.has("a")) dx -= 1;
+    if (keys.has("arrowright") || keys.has("d")) dx += 1;
+    if (keys.has("arrowup") || keys.has("w")) dy -= 1;
+    if (keys.has("arrowdown") || keys.has("s")) dy += 1;
+
+    if (dx || dy) {
+      const len = Math.hypot(dx, dy);
+      player.x += (dx / len) * speed * dt;
+      player.y += (dy / len) * speed * dt;
+    } else if (pointerTarget) {
+      const k = 1 - Math.pow(0.0005, dt); // smooth follow
+      player.x += (pointerTarget.x - player.x) * k;
+      player.y += (pointerTarget.y - 40 - player.y) * k; // offset so finger doesn't hide the moth
+    }
+    player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+    player.y = Math.max(player.r, Math.min(H - player.r, player.y));
+
+    // Spawning
+    state.spawnLantern -= dt;
+    if (state.spawnLantern <= 0) {
+      lanterns.push({ x: rand(30, W - 30), y: -30, r: 16, v: rand(110, 170) * (0.9 + level * 0.1), sway: rand(0, 6) });
+      state.spawnLantern = rand(0.6, 1.2) / Math.sqrt(level);
+    }
+    state.spawnHazard -= dt;
+    if (state.spawnHazard <= 0) {
+      hazards.push({ x: rand(30, W - 30), y: -30, r: 20, v: rand(140, 210) * (0.9 + level * 0.15), rot: 0 });
+      state.spawnHazard = rand(0.5, 1.1) / level;
+    }
+
+    // Lanterns
+    for (const l of lanterns) {
+      l.y += l.v * dt;
+      l.x += Math.sin(state.time * 2 + l.sway) * 30 * dt;
+      if (Math.hypot(l.x - player.x, l.y - player.y) < l.r + player.r) {
+        l.dead = true;
+        state.score += 10;
+        burst(l.x, l.y, COLORS.lantern);
+        sfx.collect();
+      } else if (l.y > H + 40) {
+        l.dead = true;
+      }
+    }
+    lanterns = lanterns.filter((l) => !l.dead);
+
+    // Hazards
+    for (const h of hazards) {
+      h.y += h.v * dt;
+      h.rot += dt * 2;
+      if (state.invuln <= 0 && Math.hypot(h.x - player.x, h.y - player.y) < h.r + player.r - 4) {
+        h.dead = true;
+        state.lives -= 1;
+        state.invuln = 1.2;
+        state.shake = 0.25;
+        burst(h.x, h.y, "#ff5d73", 20);
+        sfx.hit();
+        if (state.lives <= 0) { endGame(); break; }
+      } else if (h.y > H + 40) {
+        h.dead = true;
+        state.score += 1; // small reward for surviving
+      }
+    }
+    hazards = hazards.filter((h) => !h.dead);
+  }
+
+  // ---------- Draw ----------
+  function drawSprite(img, x, y, size, fallbackColor, rotation = 0, alpha = 1) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rotation);
+    ctx.globalAlpha = alpha;
+    if (img && img.complete && img.naturalWidth > 0) {
+      ctx.drawImage(img, -size / 2, -size / 2, size, size);
+    } else {
+      ctx.fillStyle = fallbackColor;
+      ctx.beginPath();
+      ctx.arc(0, 0, size / 2.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function draw() {
+    ctx.save();
+    if (state.shake > 0) ctx.translate(rand(-4, 4), rand(-4, 4));
+
+    // Background
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, "#0b1522");
+    grad.addColorStop(1, "#1b3550");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = "#cfe0f2";
+    for (const s of stars) {
+      ctx.globalAlpha = 0.25 + s.s / 3;
+      ctx.fillRect(s.x, s.y, s.s, s.s);
+    }
+    ctx.globalAlpha = 1;
+
+    // Lanterns with glow
+    for (const l of lanterns) {
+      const g = ctx.createRadialGradient(l.x, l.y, 4, l.x, l.y, 46);
+      g.addColorStop(0, "rgba(255,200,87,0.35)");
+      g.addColorStop(1, "rgba(255,200,87,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(l.x - 46, l.y - 46, 92, 92);
+      drawSprite(images.lantern, l.x, l.y, 44, COLORS.lantern);
+    }
+
+    for (const h of hazards) drawSprite(images.hazard, h.x, h.y, 54, COLORS.hazard, h.rot);
+
+    // Player (blinks while invulnerable)
+    if (state.mode !== "over") {
+      const blink = state.invuln > 0 && Math.floor(state.invuln * 12) % 2 === 0;
+      const bob = Math.sin(performance.now() / 120) * 2;
+      drawSprite(images.player, player.x, player.y + bob, 56, COLORS.player, 0, blink ? 0.35 : 1);
+    }
+
+    // Particles
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // HUD
+    if (state.mode === "playing") {
+      ctx.fillStyle = COLORS.text;
+      ctx.font = "24px Georgia, serif";
+      ctx.textAlign = "left";
+      ctx.fillText(String(state.score), 16, 36);
+      ctx.textAlign = "right";
+      ctx.font = "14px Georgia, serif";
+      ctx.fillStyle = "#9fb3c8";
+      ctx.fillText("Best " + best, W - 16, 22);
+      for (let i = 0; i < 3; i++) {
+        ctx.globalAlpha = i < state.lives ? 1 : 0.2;
+        drawSprite(images.lantern, W - 26 - i * 28, 46, 22, COLORS.lantern);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- Boot: load images, then start loop ----------
+  function loadImages() {
+    const jobs = Object.entries(IMAGE_PATHS).map(([name, src]) =>
+      new Promise((resolve) => {
+        const img = new Image();
+        img.onload = img.onerror = () => resolve();
+        img.src = src;
+        images[name] = img;
+      })
+    );
+    return Promise.all(jobs);
+  }
+
+  loadImages().then(() => requestAnimationFrame(frame));
+})();
